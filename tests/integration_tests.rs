@@ -12,7 +12,7 @@ async fn it_can_be_consumed_as_stream() {
     let table_name = config.table_name();
     let sdk_config = config.aws_sdk_config();
 
-    let client = subscriber::Client::new(sdk_config);
+    let client = subscriber::SDKClient::new(sdk_config);
     let mut stream = subscriber::stream::builder()
         .table_name(table_name)
         .client(client)

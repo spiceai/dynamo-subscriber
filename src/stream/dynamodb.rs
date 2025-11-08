@@ -1,7 +1,7 @@
 use super::{
     channel::{self, ConsumerChannel, ProducerChannel},
     types::{GetShardsOutput, Lineages, Shard},
-    DynamodbClient, Error,
+    DynamodbSDKClient, Error,
 };
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
 use std::{
@@ -10,46 +10,66 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
+use std::collections::HashSet;
 use tokio::{
     sync::mpsc,
     time::{sleep, Duration},
 };
 use tokio_stream::Stream;
 use tracing::error;
+use crate::types::checkpoint::Checkpoint;
+use crate::types::initial_interator_type::InitialIteratorType;
+
+const DEFAULT_INTERVAL: Duration = Duration::from_secs(3);
+const DEFAULT_BUFFER_SIZE: usize = 100;
 
 /// The polling half of DynamoDB Streams.
 #[derive(Debug)]
 pub struct DynamodbStreamProducer<Client>
 where
-    Client: DynamodbClient + 'static,
+    Client: DynamodbSDKClient + 'static,
 {
     table_name: String,
     stream_arn: String,
     shards: Option<Vec<Shard>>,
     channel: ProducerChannel,
-    client: Client,
-    shard_iterator_type: ShardIteratorType,
+    client: Arc<Client>,
     interval: Option<Duration>,
     sender: mpsc::Sender<Vec<Record>>,
+    // Need to evict old shards from the set.
+    seen_shard_ids: HashSet<String>,
 }
 
 impl<Client> DynamodbStreamProducer<Client>
 where
-    Client: DynamodbClient + 'static,
+    Client: DynamodbSDKClient + 'static,
 {
     fn client(&self) -> Arc<Client> {
-        Arc::new(self.client.clone())
+        Arc::clone(&self.client)
     }
 
     /// Get shards and shard iterator ids for first attempt to get records.
-    async fn init(&mut self) -> Result<(), Error> {
-        let stream_arn = self.client.get_stream_arn(&self.table_name).await?;
+    async fn init(&mut self, initial: InitialIteratorType) -> Result<(), Error> {
+        let stream_arn = self.client.get_stream_arn(self.table_name.clone()).await?;
         self.stream_arn = stream_arn;
 
-        let shards = self.get_all_shards().await?;
-        let shards = self
-            .get_shard_iterators(shards, self.shard_iterator_type.clone())
-            .await;
+        let shards = match initial {
+            InitialIteratorType::Latest => {
+                self.initialize_all_shards(ShardIteratorType::Latest).await
+            }
+            InitialIteratorType::TrimHorizon => {
+                self.initialize_all_shards(ShardIteratorType::TrimHorizon)
+                    .await
+            }
+            InitialIteratorType::AtCheckpoint(checkpoint) => {
+                self.initialize_checkpoint(checkpoint, ShardIteratorType::AtSequenceNumber)
+                    .await
+            }
+            InitialIteratorType::AfterCheckpoint(checkpoint) => {
+                self.initialize_checkpoint(checkpoint, ShardIteratorType::AfterSequenceNumber)
+                    .await
+            }
+        }?;
 
         self.shards = Some(shards);
         self.channel.send_init();
@@ -57,19 +77,80 @@ where
         Ok(())
     }
 
+    async fn initialize_all_shards(
+        &self,
+        iterator_type: ShardIteratorType,
+    ) -> Result<Vec<Shard>, Error> {
+        let shards = self.client.get_all_shards(&self.stream_arn).await?;
+        let shards = self.get_shard_iterators(shards, iterator_type).await;
+
+        Ok(shards)
+    }
+
+    async fn initialize_checkpoint(
+        &self,
+        checkpoint: Checkpoint,
+        iterator_type: ShardIteratorType,
+    ) -> Result<Vec<Shard>, Error> {
+        let mut shards = Vec::new();
+
+        for (shard_id, sequence_number) in checkpoint.shard_sequence_numbers {
+            let shard = self
+                .client
+                .get_shard_with_iterator(
+                    self.stream_arn.clone(),
+                    &shard_id,
+                    None,
+                    &iterator_type,
+                    Some(sequence_number),
+                )
+                .await?;
+            shards.push(shard);
+        }
+
+        Ok(shards)
+    }
+
     /// Get records and renew shards for next iteration.
-    async fn iterate(&mut self) -> Result<Vec<Record>, Error> {
-        let lineages: Lineages = self.shards.take().unwrap_or_default().into();
-        let (mut shards, records) = lineages.get_records(self.client()).await;
+    async fn iterate(&mut self) -> Result<Vec<Vec<Record>>, Error> {
+        let shards_to_look_into = self.shards.take().unwrap_or_default();
+        for shard in &shards_to_look_into {
+            self.seen_shard_ids.insert(shard.id().to_string());
+        }
+
+        // This buffer prevents mpsc::channel from panic when passed zero as its argument.
+        let buf = cmp::max(1, shards_to_look_into.len());
+        let (tx, mut rx) = mpsc::channel::<(Option<Shard>, Vec<Record>)>(buf);
+
+        // lineages based on shards we want to look into
+        let lineages: Lineages = shards_to_look_into.clone().into();
+
+        lineages.get_records(&self.client(), &tx);
+
+        let mut shards: Vec<Shard> = vec![];
+        let mut records: Vec<Vec<Record>> = vec![];
+
+        while let Some((opt, shard_records)) = rx.recv().await {
+            // These shards represent shards with non-empty iterator
+            if let Some(shard) = opt {
+                shards.push(shard);
+            }
+
+            if !shard_records.is_empty() {
+                records.push(shard_records);
+            }
+        }
 
         let new_shards = self
-            .get_all_shards()
+            .client
+            .get_all_shards(&self.stream_arn)
             .await?
             .into_iter()
-            .filter(|shard| !shards.iter().any(|s| s.id() == shard.id()))
+            .filter(|shard| !self.seen_shard_ids.contains(shard.id()))
             .collect::<Vec<Shard>>();
+
         let mut new_shards = self
-            .get_shard_iterators(new_shards, ShardIteratorType::Latest)
+            .get_shard_iterators(new_shards, ShardIteratorType::TrimHorizon)
             .await;
 
         shards.append(&mut new_shards);
@@ -79,17 +160,17 @@ where
     }
 
     /// Poll the DynamoDB Streams.
-    async fn streaming(&mut self) {
-        ok_or_return!(self.init().await, |err| {
-            error!(
+    async fn streaming(&mut self, initial: InitialIteratorType) {
+        ok_or_return!(self.init(initial).await, |err| {
+            tracing::error!(
                 "Unexpected error during initialization: {err}. Skip polling {} table.",
                 self.table_name,
             );
         });
 
         loop {
-            let records = ok_or_return!(self.iterate().await, |err| {
-                error!(
+            let record_batches = ok_or_return!(self.iterate().await, |err| {
+                tracing::error!(
                     "Unexpected error during iteration: {err}. Stop polling {} table.",
                     self.table_name,
                 );
@@ -99,8 +180,12 @@ where
                 return;
             }
 
-            if !records.is_empty() && self.sender.send(records).await.is_err() {
-                return;
+            if !record_batches.is_empty() {
+                for record_batch in record_batches {
+                    if self.sender.send(record_batch).await.is_err() {
+                        return;
+                    }
+                }
             }
 
             if let Some(duration) = self.interval {
@@ -147,15 +232,20 @@ where
             let shard_iterator_type = shard_iterator_type.clone();
 
             tokio::spawn(async move {
-                let result = client.get_shard_with_iterator(stream_arn, shard, shard_iterator_type);
-                let shard_opt = ok_or_return!(result.await, |err| {
-                    error!("Unexpected error during getting shard iterator: {err}");
+                let result = client.get_shard_with_iterator(
+                    stream_arn,
+                    shard.id(),
+                    shard.parent_shard_id(),
+                    &shard_iterator_type,
+                    None,
+                );
+
+                let shard = ok_or_return!(result.await, |err| {
+                    tracing::error!("Unexpected error during getting shard iterator: {err}");
                 });
 
-                if let Some(shard) = shard_opt {
-                    if let Err(err) = tx.send(shard).await {
-                        error!("Unexpected error during sending shard: {err}");
-                    }
+                if let Err(err) = tx.send(shard).await {
+                    tracing::error!("Unexpected error during sending shard: {err}");
                 }
             });
         }
@@ -191,7 +281,7 @@ impl DynamodbStream {
     ///
     /// # async fn wrapper() {
     /// # let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-    /// # let client = subscriber::Client::new(&config);
+    /// # let client = subscriber::SDKClient::new(&config);
     /// let mut stream = subscriber::stream::builder()
     ///     .client(client)
     ///     .table_name("People")
@@ -241,60 +331,32 @@ impl AsMut<mpsc::Receiver<Vec<Record>>> for DynamodbStream {
 #[derive(Debug)]
 pub struct DynamodbStreamBuilder<Client>
 where
-    Client: DynamodbClient + 'static,
+    Client: DynamodbSDKClient + 'static,
 {
-    table_name: Option<String>,
-    client: Option<Client>,
-    shard_iterator_type: ShardIteratorType,
+    table_name: String,
+    client: Client,
     interval: Option<Duration>,
     buffer: usize,
+    initial_iterator_type: InitialIteratorType,
 }
 
 impl<Client> DynamodbStreamBuilder<Client>
 where
-    Client: DynamodbClient + 'static,
+    Client: DynamodbSDKClient + 'static,
 {
     /// Create a new `DynamodbStreamBuilder`.
-    pub fn new() -> Self {
+    #[must_use]
+    pub fn new(
+        client: Client,
+        table_name: String,
+        initial_iterator_type: InitialIteratorType,
+    ) -> Self {
         Self {
-            table_name: None,
-            client: None,
-            shard_iterator_type: ShardIteratorType::Latest,
-            interval: Some(Duration::from_secs(3)),
-            buffer: 100,
-        }
-    }
-
-    /// Set table name you want to retrieve records from.
-    ///
-    /// **Setting any table name is required** before the build method is called.
-    pub fn table_name(self, table_name: impl Into<String>) -> Self {
-        Self {
-            table_name: Some(table_name.into()),
-            ..self
-        }
-    }
-
-    /// Set client to call AWS APIs.
-    ///
-    /// **Setting any client is required** before the build method is called.
-    pub fn client(self, client: Client) -> Self {
-        Self {
-            client: Some(client),
-            ..self
-        }
-    }
-
-    /// Set [`ShardIteratorType`] to get records for the first time.
-    /// After the first time, the DynamodbStream uses the shard iterator from the previous
-    /// `get records` operation outputs.
-    ///
-    /// Setting any shard iterator type is optional. If you omit calling this method,
-    /// `ShardIteratorType::Latest` is used as default value.
-    pub fn shard_iterator_type(self, shard_iterator_type: ShardIteratorType) -> Self {
-        Self {
-            shard_iterator_type,
-            ..self
+            client,
+            table_name,
+            interval: Some(DEFAULT_INTERVAL),
+            buffer: DEFAULT_BUFFER_SIZE,
+            initial_iterator_type,
         }
     }
 
@@ -338,36 +400,26 @@ where
     }
 
     fn build_producer(self) -> (ConsumerChannel, mpsc::Receiver<Vec<Record>>) {
-        let table_name = self.table_name.expect("`table_name` is required");
-        let client = self.client.expect("`client` is required");
-
         let (p_half, c_half) = channel::new();
         let (tx_mpsc, rx_mpsc) = mpsc::channel::<Vec<Record>>(self.buffer);
 
         let mut producer = DynamodbStreamProducer {
-            table_name,
-            stream_arn: "".to_string(),
+            table_name: self.table_name,
+            stream_arn: String::new(),
             shards: None,
             channel: p_half,
-            client,
-            shard_iterator_type: self.shard_iterator_type,
+            client: Arc::new(self.client),
             interval: self.interval,
             sender: tx_mpsc,
+            seen_shard_ids: HashSet::new(),
         };
 
+        let initial_iterator_type = self.initial_iterator_type;
+
         tokio::spawn(async move {
-            producer.streaming().await;
+            producer.streaming(initial_iterator_type).await;
         });
 
         (c_half, rx_mpsc)
-    }
-}
-
-impl<Client> Default for DynamodbStreamBuilder<Client>
-where
-    Client: DynamodbClient + 'static,
-{
-    fn default() -> Self {
-        Self::new()
     }
 }

@@ -6,6 +6,7 @@ pub struct Shard {
     id: String,
     iterator: Option<String>,
     parent_shard_id: Option<String>,
+    pub ending_sequence_number: Option<String>,
 }
 
 impl Shard {
@@ -36,10 +37,23 @@ impl Shard {
     /// let shard = Shard::new(original);
     /// assert!(shard.is_none());
     /// ```
-    pub fn new(shard: dynamodbstreams::types::Shard) -> Option<Self> {
+    pub fn new(
+        shard_id: String,
+        parent_shard_id: Option<String>,
+        iterator: Option<String>,
+    ) -> Self {
+        Self {
+            id: shard_id,
+            iterator,
+            parent_shard_id,
+            ending_sequence_number: None,
+        }
+    }
+    pub fn from_shard(shard: dynamodbstreams::types::Shard) -> Option<Self> {
         let dynamodbstreams::types::Shard {
             shard_id,
             parent_shard_id,
+            sequence_number_range,
             ..
         } = shard;
 
@@ -47,8 +61,10 @@ impl Shard {
             id,
             iterator: None,
             parent_shard_id,
+            ending_sequence_number: sequence_number_range.and_then(|r| r.ending_sequence_number),
         })
     }
+
 
     /// Return the shard id.
     pub fn id(&self) -> &str {
