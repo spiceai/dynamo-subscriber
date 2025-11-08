@@ -1,7 +1,7 @@
 use super::{
     DynamodbSDKClient, Error,
     channel::{self, ConsumerChannel, ProducerChannel},
-    types::{GetShardsOutput, Lineages, Shard},
+    types::{Lineages, Shard},
 };
 use crate::types::initial_interator_type::InitialIteratorType;
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
@@ -129,7 +129,7 @@ where
     /// Poll the DynamoDB Streams.
     async fn streaming(&mut self, initial: InitialIteratorType) {
         ok_or_return!(self.init(initial).await, |err| {
-            tracing::error!(
+            error!(
                 "Unexpected error during initialization: {err}. Skip polling {} table.",
                 self.table_name,
             );
@@ -137,7 +137,7 @@ where
 
         loop {
             let record_batches = ok_or_return!(self.iterate().await, |err| {
-                tracing::error!(
+                error!(
                     "Unexpected error during iteration: {err}. Stop polling {} table.",
                     self.table_name,
                 );
@@ -159,25 +159,6 @@ where
                 sleep(duration).await;
             }
         }
-    }
-
-    /// Get all shards from the DynamoDB table.
-    async fn get_all_shards(&self) -> Result<Vec<Shard>, Error> {
-        let GetShardsOutput {
-            mut shards,
-            mut last_shard_id,
-        } = self.client.get_shards(&self.stream_arn, None).await?;
-
-        while last_shard_id.is_some() {
-            let mut output = self
-                .client
-                .get_shards(&self.stream_arn, last_shard_id.take())
-                .await?;
-            shards.append(&mut output.shards);
-            last_shard_id = output.last_shard_id;
-        }
-
-        Ok(shards)
     }
 
     /// Get and set shard iterator.
@@ -208,11 +189,11 @@ where
                 );
 
                 let shard = ok_or_return!(result.await, |err| {
-                    tracing::error!("Unexpected error during getting shard iterator: {err}");
+                    error!("Unexpected error during getting shard iterator: {err}");
                 });
 
                 if let Err(err) = tx.send(shard).await {
-                    tracing::error!("Unexpected error during sending shard: {err}");
+                    error!("Unexpected error during sending shard: {err}");
                 }
             });
         }

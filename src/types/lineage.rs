@@ -1,11 +1,10 @@
 use super::super::client_sdk::DynamodbSDKClient;
 use super::Shard;
 
-use async_recursion::async_recursion;
 use aws_sdk_dynamodbstreams::types::Record;
 use std::pin::Pin;
-use std::{cmp, sync::Arc};
-use tokio::sync::mpsc::{self, Sender};
+use std::sync::Arc;
+use tokio::sync::mpsc::Sender;
 use tracing::error;
 
 /// A representation of shard lineage(parent and children).
@@ -81,11 +80,6 @@ impl Lineage {
         }
     }
 
-    /// Return the number of shards the lineage has.
-    fn len(&self) -> usize {
-        self.children.iter().fold(0, |acc, l| acc + l.len()) + 1
-    }
-
     /// Get records and next shard iterator, then send them. This method ensures that
     /// processing shards in correct order (processing parent shard before children).
     fn get_records<Client>(
@@ -101,14 +95,14 @@ impl Lineage {
 
             let (shard, records) = client.get_records(shard).await.map_or_else(
                 |err| {
-                    tracing::error!("Unexpected error during getting records: {err}");
+                    error!("Unexpected error during getting records: {err}");
                     (None, vec![])
                 },
                 |output| (output.shard, output.records),
             );
 
             if let Err(err) = tx.send((shard, records)).await {
-                tracing::error!("Unexpected error during sending shard and records: {err}");
+                error!("Unexpected error during sending shard and records: {err}");
             }
 
             for child in children {
@@ -187,14 +181,6 @@ impl From<Vec<Shard>> for Lineages {
     fn from(shards: Vec<Shard>) -> Self {
         shards.into_iter().fold(Self::new(), Self::init)
     }
-}
-
-fn sequence_number(record: &Record) -> String {
-    record
-        .dynamodb()
-        .and_then(|r| r.sequence_number())
-        .unwrap_or_default()
-        .to_string()
 }
 
 #[cfg(test)]
