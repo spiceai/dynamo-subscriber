@@ -1,5 +1,4 @@
 use crate::stream::{DynamodbStream, DynamodbStreamBuilder};
-use crate::types::checkpoint::Checkpoint;
 use crate::types::initial_interator_type::InitialIteratorType;
 use crate::{DynamodbSDKClient, SDKClient};
 use aws_config::SdkConfig;
@@ -37,30 +36,6 @@ where
             interval: Some(DEFAULT_INTERVAL),
             buffer: DEFAULT_BUFFER_SIZE,
         }
-    }
-
-    #[must_use]
-    pub fn stream_from_after_checkpoint(&self, checkpoint: Checkpoint) -> DynamodbStream {
-        DynamodbStreamBuilder::new(
-            self.sdk_client.clone(),
-            self.table_name.clone(),
-            InitialIteratorType::AfterCheckpoint(checkpoint),
-        )
-        .interval(self.interval)
-        .buffer(self.buffer)
-        .build()
-    }
-
-    #[must_use]
-    pub fn stream_from_at_checkpoint(&self, checkpoint: Checkpoint) -> DynamodbStream {
-        DynamodbStreamBuilder::new(
-            self.sdk_client.clone(),
-            self.table_name.clone(),
-            InitialIteratorType::AtCheckpoint(checkpoint),
-        )
-        .interval(self.interval)
-        .buffer(self.buffer)
-        .build()
     }
 
     #[must_use]

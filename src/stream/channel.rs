@@ -1,4 +1,4 @@
-use tokio::sync::oneshot::{self, error::TryRecvError, Receiver, Sender};
+use tokio::sync::oneshot::{self, Receiver, Sender, error::TryRecvError};
 use tracing::error;
 
 /// Create a pair of channel.

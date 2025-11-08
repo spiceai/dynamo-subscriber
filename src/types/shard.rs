@@ -65,7 +65,6 @@ impl Shard {
         })
     }
 
-
     /// Return the shard id.
     pub fn id(&self) -> &str {
         self.id.as_str()

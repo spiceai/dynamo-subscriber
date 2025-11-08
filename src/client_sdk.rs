@@ -7,13 +7,13 @@ use async_trait::async_trait;
 use aws_config::SdkConfig;
 use aws_sdk_dynamodb::Client as DbClient;
 use aws_sdk_dynamodbstreams::{
+    Client as StreamsClient,
     error::SdkError,
     operation::{
         get_records::{GetRecordsError, GetRecordsOutput as SdkGetRecordsOutput},
         get_shard_iterator::GetShardIteratorError,
     },
     types::ShardIteratorType,
-    Client as StreamsClient,
 };
 use tracing::warn;
 

@@ -1,15 +1,15 @@
-use aws_config::{retry::RetryConfig, BehaviorVersion, Region, SdkConfig};
-use aws_credential_types::{provider::SharedCredentialsProvider, Credentials};
+use aws_config::{BehaviorVersion, Region, SdkConfig, retry::RetryConfig};
+use aws_credential_types::{Credentials, provider::SharedCredentialsProvider};
 use aws_sdk_dynamodb::{
+    Client,
     types::{
         AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType,
         ScalarAttributeType, StreamSpecification, StreamViewType,
     },
-    Client,
 };
 use aws_sdk_dynamodbstreams::types::Record;
 use dynamo_subscriber::stream::ConsumerChannel;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use ulid::Ulid;
 
 const TABLE: &str = "People";

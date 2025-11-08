@@ -1,24 +1,23 @@
 use super::{
+    DynamodbSDKClient, Error,
     channel::{self, ConsumerChannel, ProducerChannel},
     types::{GetShardsOutput, Lineages, Shard},
-    DynamodbSDKClient, Error,
 };
+use crate::types::initial_interator_type::InitialIteratorType;
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
+use std::collections::HashSet;
 use std::{
     cmp,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
-use std::collections::HashSet;
 use tokio::{
     sync::mpsc,
-    time::{sleep, Duration},
+    time::{Duration, sleep},
 };
 use tokio_stream::Stream;
 use tracing::error;
-use crate::types::checkpoint::Checkpoint;
-use crate::types::initial_interator_type::InitialIteratorType;
 
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(3);
 const DEFAULT_BUFFER_SIZE: usize = 100;
@@ -61,14 +60,6 @@ where
                 self.initialize_all_shards(ShardIteratorType::TrimHorizon)
                     .await
             }
-            InitialIteratorType::AtCheckpoint(checkpoint) => {
-                self.initialize_checkpoint(checkpoint, ShardIteratorType::AtSequenceNumber)
-                    .await
-            }
-            InitialIteratorType::AfterCheckpoint(checkpoint) => {
-                self.initialize_checkpoint(checkpoint, ShardIteratorType::AfterSequenceNumber)
-                    .await
-            }
         }?;
 
         self.shards = Some(shards);
@@ -83,30 +74,6 @@ where
     ) -> Result<Vec<Shard>, Error> {
         let shards = self.client.get_all_shards(&self.stream_arn).await?;
         let shards = self.get_shard_iterators(shards, iterator_type).await;
-
-        Ok(shards)
-    }
-
-    async fn initialize_checkpoint(
-        &self,
-        checkpoint: Checkpoint,
-        iterator_type: ShardIteratorType,
-    ) -> Result<Vec<Shard>, Error> {
-        let mut shards = Vec::new();
-
-        for (shard_id, sequence_number) in checkpoint.shard_sequence_numbers {
-            let shard = self
-                .client
-                .get_shard_with_iterator(
-                    self.stream_arn.clone(),
-                    &shard_id,
-                    None,
-                    &iterator_type,
-                    Some(sequence_number),
-                )
-                .await?;
-            shards.push(shard);
-        }
 
         Ok(shards)
     }

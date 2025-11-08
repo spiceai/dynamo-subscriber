@@ -3,8 +3,8 @@ use super::Shard;
 
 use async_recursion::async_recursion;
 use aws_sdk_dynamodbstreams::types::Record;
-use std::{cmp, sync::Arc};
 use std::pin::Pin;
+use std::{cmp, sync::Arc};
 use tokio::sync::mpsc::{self, Sender};
 use tracing::error;
 
@@ -451,4 +451,3 @@ mod tests {
         );
     }
 }
-
