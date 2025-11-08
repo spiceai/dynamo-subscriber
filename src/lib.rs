@@ -66,4 +66,5 @@ pub mod types;
 /// Implementation for Dynamodb Streams.
 pub mod stream;
 
-pub use client::ClientBuilder;
+pub use client::{Client, ClientBuilder};
+pub use client_sdk::SDKClient;
