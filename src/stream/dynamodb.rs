@@ -93,6 +93,7 @@ where
         let lineages: Lineages = shards_to_look_into.clone().into();
 
         lineages.get_records(&self.client(), &tx);
+        drop(tx);
 
         let mut shards: Vec<Shard> = vec![];
         let mut records: Vec<Vec<Record>> = vec![];

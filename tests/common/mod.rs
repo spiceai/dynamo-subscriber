@@ -44,6 +44,7 @@ pub async fn setup() -> TestConfig {
         .region(Some(Region::from_static("us-east-1")))
         .build();
 
+    drop_table(&config).await;
     create_table(&config).await;
 
     TestConfig {
@@ -119,10 +120,9 @@ async fn create_table(config: &SdkConfig) {
 }
 
 async fn drop_table(config: &SdkConfig) {
-    Client::new(config)
+    let _ = Client::new(config)
         .delete_table()
         .table_name(TABLE)
         .send()
-        .await
-        .unwrap();
+        .await;
 }

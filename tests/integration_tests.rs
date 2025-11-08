@@ -1,8 +1,7 @@
 mod common;
 
-use dynamo_subscriber as subscriber;
-
 use common::{pk, put_item, setup, teardown, wait_until_initialized};
+use dynamo_subscriber::ClientBuilder;
 use tokio_stream::StreamExt;
 
 #[tokio::test]
@@ -12,12 +11,11 @@ async fn it_can_be_consumed_as_stream() {
     let table_name = config.table_name();
     let sdk_config = config.aws_sdk_config();
 
-    let client = subscriber::SDKClient::new(sdk_config);
-    let mut stream = subscriber::stream::builder()
-        .table_name(table_name)
-        .client(client)
+    let client = ClientBuilder::new(sdk_config.clone(), table_name.to_string())
         .interval(None)
         .build();
+
+    let mut stream = client.stream_from_trim_horizon();
 
     let channel_opt = stream.take_channel();
     assert!(channel_opt.is_some());

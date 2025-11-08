@@ -1,6 +1,6 @@
+use crate::client_sdk::{DynamodbSDKClient, SDKClient};
 use crate::stream::{DynamodbStream, DynamodbStreamBuilder};
 use crate::types::initial_interator_type::InitialIteratorType;
-use crate::{DynamodbSDKClient, SDKClient};
 use aws_config::SdkConfig;
 use std::time::Duration;
 

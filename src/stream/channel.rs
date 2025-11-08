@@ -37,12 +37,13 @@ impl ProducerChannel {
     /// Send `Initialized` event to the channel half.
     pub fn send_init(&mut self) {
         if let Some(tx) = self.sender.take()
-            && let Err(err) = tx.send(()) {
-                error!(
-                    "Unexpected error during sending initialized event: {:?}",
-                    err
-                );
-            }
+            && let Err(err) = tx.send(())
+        {
+            error!(
+                "Unexpected error during sending initialized event: {:?}",
+                err
+            );
+        }
     }
 
     /// Return true if the `Stop polling` event is received.
