@@ -34,7 +34,7 @@ async fn it_can_be_consumed_as_stream() {
     let records_opt = stream.next().await;
     assert!(records_opt.is_some());
 
-    let records = records_opt.unwrap();
+    let records = records_opt.unwrap().unwrap();
     assert_eq!(records.len(), 1);
 
     let record = records.get(0).unwrap();
@@ -44,7 +44,7 @@ async fn it_can_be_consumed_as_stream() {
     let records_opt = stream.next().await;
     assert!(records_opt.is_some());
 
-    let records = records_opt.unwrap();
+    let records = records_opt.unwrap().unwrap();
     assert_eq!(records.len(), 1);
 
     let record = records.get(0).unwrap();

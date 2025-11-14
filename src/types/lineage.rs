@@ -1,7 +1,7 @@
 use super::super::client_sdk::DynamodbSDKClient;
 use super::Shard;
 
-use aws_sdk_dynamodbstreams::types::Record;
+use crate::error::StreamResult;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
@@ -85,7 +85,7 @@ impl Lineage {
     fn get_records<Client>(
         self,
         client: Arc<Client>,
-        tx: Sender<(Option<Shard>, Vec<Record>)>,
+        tx: Sender<(Option<Shard>, StreamResult)>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>>
     where
         Client: DynamodbSDKClient + Send + Sync + 'static,
@@ -93,28 +93,50 @@ impl Lineage {
         Box::pin(async move {
             let Lineage { shard, children } = self;
 
-            let (shard, records) = client.get_records(shard).await.map_or_else(
-                |err| {
-                    error!("Unexpected error during getting records: {err}");
-                    (None, vec![])
-                },
-                |output| (output.shard, output.records),
-            );
+            match client.get_records(shard.clone()).await {
+                Ok(output) => {
+                    // Send parent's records
+                    if tx.send((output.shard, Ok(output.records))).await.is_err() {
+                        return;
+                    }
 
-            if let Err(err) = tx.send((shard, records)).await {
-                error!("Unexpected error during sending shard and records: {err}");
-            }
+                    preserve_subtree(children, &tx).await;
+                }
+                Err(err) => {
+                    // Parent failed - send error but DON'T process children
+                    error!("Parent shard failed: {err}");
+                    if tx.send((Some(shard), Err(err))).await.is_err() {
+                        // Channel closed - just return
+                        return;
+                    }
 
-            for child in children {
-                let tx = tx.clone();
-                let client = Arc::clone(&client);
-
-                tokio::spawn(async move {
-                    child.get_records(client, tx).await;
-                });
+                    preserve_subtree(children, &tx).await;
+                }
             }
         })
     }
+}
+
+// Helper to recursively preserve all descendants
+fn preserve_subtree(
+    lineages: Vec<Lineage>,
+    tx: &Sender<(Option<Shard>, StreamResult)>,
+) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    Box::pin(async move {
+        for lineage in lineages {
+            let Lineage { shard, children } = lineage;
+
+            // Send this shard back to preserve it
+            if tx.send((Some(shard), Ok(vec![]))).await.is_err() {
+                return;
+            }
+
+            // Recursively preserve its children
+            if !children.is_empty() {
+                preserve_subtree(children, tx).await;
+            }
+        }
+    })
 }
 
 /// A representation of group of shard lineage(parent and children).
@@ -162,7 +184,7 @@ impl Lineages {
     pub fn get_records<Client>(
         self,
         client: &Arc<Client>,
-        tx: &Sender<(Option<Shard>, Vec<Record>)>,
+        tx: &Sender<(Option<Shard>, StreamResult)>,
     ) where
         Client: DynamodbSDKClient + 'static,
     {
@@ -188,7 +210,7 @@ mod tests {
     use super::super::{super::error::Error, GetRecordsOutput, GetShardsOutput};
     use super::*;
     use async_trait::async_trait;
-    use aws_sdk_dynamodbstreams::types::{ShardIteratorType, StreamRecord};
+    use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType, StreamRecord};
     use itertools::Itertools;
     use std::sync::{Arc, Mutex};
 
@@ -382,6 +404,21 @@ mod tests {
         }
     }
 
+    fn extract_sequence_numbers(records: &[Record]) -> Vec<String> {
+        records
+            .iter()
+            .map(|r| {
+                r.dynamodb
+                    .as_ref()
+                    .expect("dynamodb")
+                    .sequence_number
+                    .as_ref()
+                    .expect("sequence_number")
+                    .to_string()
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn lineages_get_records_returns_shards_and_records() {
         let s0 = create_shard("0", None);
@@ -414,26 +451,17 @@ mod tests {
             records.extend(recs);
         }
 
+        assert_eq!(shards.len(), 3);
         assert_include(&shards, "3");
-        assert_include(&shards, "4");
-        assert_include(&shards, "5");
+        assert_include(&shards, "1");
+        assert_include(&shards, "2");
 
+        assert_eq!(records.len(), 3);
         assert_eq!(
-            records
-                .iter()
-                .map(|r| r
-                    .dynamodb
-                    .as_ref()
-                    .expect("dynamodb")
-                    .sequence_number
-                    .as_ref()
-                    .expect("sequence_number")
-                    .to_string())
-                .collect::<Vec<String>>(),
-            [
-                "0012", "0004", "0008", "0001", "0003", "0010", "0011", "0009", "0006", "0002",
-                "0005", "0013", "0007"
-            ]
+            extract_sequence_numbers(&records[0]),
+            ["0012", "0004", "0008", "0001"]
         );
+        assert_eq!(extract_sequence_numbers(&records[1]), Vec::<String>::new());
+        assert_eq!(extract_sequence_numbers(&records[2]), Vec::<String>::new());
     }
 }

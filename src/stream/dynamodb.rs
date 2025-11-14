@@ -3,8 +3,9 @@ use super::{
     channel::{self, ConsumerChannel, ProducerChannel},
     types::{Lineages, Shard},
 };
+use crate::error::StreamResult;
 use crate::types::initial_interator_type::InitialIteratorType;
-use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
+use aws_sdk_dynamodbstreams::types::ShardIteratorType;
 use std::collections::HashSet;
 use std::{
     cmp,
@@ -34,7 +35,7 @@ where
     channel: ProducerChannel,
     client: Arc<Client>,
     interval: Option<Duration>,
-    sender: mpsc::Sender<Vec<Record>>,
+    sender: mpsc::Sender<StreamResult>,
     // Need to evict old shards from the set.
     seen_shard_ids: HashSet<String>,
 }
@@ -79,7 +80,7 @@ where
     }
 
     /// Get records and renew shards for next iteration.
-    async fn iterate(&mut self) -> Result<Vec<Vec<Record>>, Error> {
+    async fn iterate(&mut self) -> Result<Vec<StreamResult>, Error> {
         let shards_to_look_into = self.shards.take().unwrap_or_default();
         for shard in &shards_to_look_into {
             self.seen_shard_ids.insert(shard.id().to_string());
@@ -87,7 +88,7 @@ where
 
         // This buffer prevents mpsc::channel from panic when passed zero as its argument.
         let buf = cmp::max(1, shards_to_look_into.len());
-        let (tx, mut rx) = mpsc::channel::<(Option<Shard>, Vec<Record>)>(buf);
+        let (tx, mut rx) = mpsc::channel::<(Option<Shard>, StreamResult)>(buf);
 
         // lineages based on shards we want to look into
         let lineages: Lineages = shards_to_look_into.clone().into();
@@ -96,17 +97,15 @@ where
         drop(tx);
 
         let mut shards: Vec<Shard> = vec![];
-        let mut records: Vec<Vec<Record>> = vec![];
+        let mut results: Vec<StreamResult> = vec![];
 
-        while let Some((opt, shard_records)) = rx.recv().await {
+        while let Some((opt, shard_result)) = rx.recv().await {
             // These shards represent shards with non-empty iterator
             if let Some(shard) = opt {
                 shards.push(shard);
             }
 
-            if !shard_records.is_empty() {
-                records.push(shard_records);
-            }
+            results.push(shard_result);
         }
 
         let new_shards = self
@@ -124,34 +123,39 @@ where
         shards.append(&mut new_shards);
         self.shards = Some(shards);
 
-        Ok(records)
+        Ok(results)
     }
 
     /// Poll the DynamoDB Streams.
     async fn streaming(&mut self, initial: InitialIteratorType) {
-        ok_or_return!(self.init(initial).await, |err| {
-            error!(
-                "Unexpected error during initialization: {err}. Skip polling {} table.",
-                self.table_name,
-            );
-        });
+        match self.init(initial).await {
+            Ok(_) => {}
+            Err(err) => {
+                let _ = self.sender.send(Err(err)).await;
+                return;
+            }
+        }
 
         loop {
-            let record_batches = ok_or_return!(self.iterate().await, |err| {
-                error!(
-                    "Unexpected error during iteration: {err}. Stop polling {} table.",
-                    self.table_name,
-                );
-            });
+            let stream_results = match self.iterate().await {
+                Ok(results) => results,
+                Err(err) => {
+                    let _ = self.sender.send(Err(err)).await;
+                    return;
+                }
+            };
 
             if self.channel.should_close() {
                 return;
             }
 
-            if !record_batches.is_empty() {
-                for record_batch in record_batches {
-                    if self.sender.send(record_batch).await.is_err() {
-                        return;
+            for result in stream_results {
+                match result {
+                    Ok(records) if records.is_empty() => continue, // Skip empty records
+                    _ => {
+                        if self.sender.send(result).await.is_err() {
+                            return;
+                        }
                     }
                 }
             }
@@ -214,7 +218,7 @@ where
 /// This struct receives DynamoDB Stream records from polling half and emit them as Rust Stream.
 #[derive(Debug)]
 pub struct DynamodbStream {
-    receiver: mpsc::Receiver<Vec<Record>>,
+    receiver: mpsc::Receiver<StreamResult>,
     channel: Option<ConsumerChannel>,
 }
 
@@ -248,7 +252,7 @@ impl DynamodbStream {
 }
 
 impl Stream for DynamodbStream {
-    type Item = Vec<Record>;
+    type Item = StreamResult;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.receiver.poll_recv(cx)
@@ -264,17 +268,17 @@ impl Drop for DynamodbStream {
     }
 }
 
-impl AsRef<mpsc::Receiver<Vec<Record>>> for DynamodbStream {
-    fn as_ref(&self) -> &mpsc::Receiver<Vec<Record>> {
-        &self.receiver
-    }
-}
-
-impl AsMut<mpsc::Receiver<Vec<Record>>> for DynamodbStream {
-    fn as_mut(&mut self) -> &mut mpsc::Receiver<Vec<Record>> {
-        &mut self.receiver
-    }
-}
+// impl AsRef<mpsc::Receiver<Vec<Record>>> for DynamodbStream {
+//     fn as_ref(&self) -> &mpsc::Receiver<Vec<Record>> {
+//         &self.receiver
+//     }
+// }
+//
+// impl AsMut<mpsc::Receiver<Vec<Record>>> for DynamodbStream {
+//     fn as_mut(&mut self) -> &mut mpsc::Receiver<Vec<Record>> {
+//         &mut self.receiver
+//     }
+// }
 
 /// A builder for [`DynamodbStream`].
 #[derive(Debug)]
@@ -348,9 +352,9 @@ where
         }
     }
 
-    fn build_producer(self) -> (ConsumerChannel, mpsc::Receiver<Vec<Record>>) {
+    fn build_producer(self) -> (ConsumerChannel, mpsc::Receiver<StreamResult>) {
         let (p_half, c_half) = channel::new();
-        let (tx_mpsc, rx_mpsc) = mpsc::channel::<Vec<Record>>(self.buffer);
+        let (tx_mpsc, rx_mpsc) = mpsc::channel::<StreamResult>(self.buffer);
 
         let mut producer = DynamodbStreamProducer {
             table_name: self.table_name,
