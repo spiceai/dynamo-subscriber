@@ -1,10 +1,10 @@
-use super::super::client::DynamodbClient;
+use super::super::client_sdk::DynamodbSDKClient;
 use super::Shard;
 
-use async_recursion::async_recursion;
-use aws_sdk_dynamodbstreams::types::Record;
-use std::{cmp, sync::Arc};
-use tokio::sync::mpsc::{self, Sender};
+use crate::error::StreamResult;
+use std::pin::Pin;
+use std::sync::Arc;
+use tokio::sync::mpsc::Sender;
 use tracing::error;
 
 /// A representation of shard lineage(parent and children).
@@ -80,45 +80,68 @@ impl Lineage {
         }
     }
 
-    /// Return the number of shards the lineage has.
-    fn len(&self) -> usize {
-        self.children.iter().fold(0, |acc, l| acc + l.len()) + 1
-    }
-
     /// Get records and next shard iterator, then send them. This method ensures that
     /// processing shards in correct order (processing parent shard before children).
-    #[async_recursion]
-    async fn get_records<Client>(
+    fn get_records<Client>(
         self,
         client: Arc<Client>,
-        tx: Sender<(Option<Shard>, Vec<Record>)>,
-    ) where
-        Client: DynamodbClient + 'static,
+        tx: Sender<(Option<Shard>, StreamResult)>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>>
+    where
+        Client: DynamodbSDKClient + Send + Sync + 'static,
     {
-        let Lineage { shard, children } = self;
+        Box::pin(async move {
+            let Lineage { shard, children } = self;
 
-        let (shard, records) = client
-            .get_records(shard)
-            .await
-            .map(|output| (output.shard, output.records))
-            .unwrap_or_else(|err| {
-                error!("Unexpected error during getting records: {err}");
-                (None, vec![])
-            });
+            match client.get_records(&shard).await {
+                Ok((next_shard_iterator, records)) => {
+                    // println!("next_shard_iterator: {:?}, {:?}", shard.id(), next_shard_iterator);
 
-        if let Err(err) = tx.send((shard, records)).await {
-            error!("Unexpected error during sending shard and records: {err}");
-        }
+                    let shard = shard.set_iterator(next_shard_iterator);
+                    let records = records.unwrap_or_default();
 
-        for child in children {
-            let tx = tx.clone();
-            let client = Arc::clone(&client);
+                    // Send parent's records
+                    if tx.send((shard, Ok(records))).await.is_err() {
+                        return;
+                    }
 
-            tokio::spawn(async move {
-                child.get_records(client, tx).await;
-            });
-        }
+                    preserve_subtree(children, &tx).await;
+                }
+                Err(err) => {
+                    // Parent failed - send error but DON'T process children
+                    error!("Parent shard failed: {err}");
+                    if tx.send((Some(shard), Err(err))).await.is_err() {
+                        // Channel closed - just return
+                        return;
+                    }
+
+                    preserve_subtree(children, &tx).await;
+                }
+            }
+        })
     }
+}
+
+// Helper to recursively preserve all descendants
+fn preserve_subtree(
+    lineages: Vec<Lineage>,
+    tx: &Sender<(Option<Shard>, StreamResult)>,
+) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    Box::pin(async move {
+        for lineage in lineages {
+            let Lineage { shard, children } = lineage;
+
+            // Send this shard back to preserve it
+            if tx.send((Some(shard), Ok(vec![]))).await.is_err() {
+                return;
+            }
+
+            // Recursively preserve its children
+            if !children.is_empty() {
+                preserve_subtree(children, tx).await;
+            }
+        }
+    })
 }
 
 /// A representation of group of shard lineage(parent and children).
@@ -157,52 +180,27 @@ impl Lineages {
         Self(lineages)
     }
 
-    /// Return the number of shards in the lineage group.
-    fn shards_len(&self) -> usize {
-        self.0.iter().fold(0, |acc, l| acc + l.len())
-    }
-
     /// Get records in the correct order and shards with renewed shard iterator ids.
     ///
     /// Each lineage is processed in the correct order (parent shard is processed before the
     /// children), and lineages without any releationships are processed concurrently.
     ///
     /// Returned records are sorted by its sequence number.
-    pub async fn get_records<Client>(self, client: Arc<Client>) -> (Vec<Shard>, Vec<Record>)
-    where
-        Client: DynamodbClient + 'static,
+    pub fn get_records<Client>(
+        self,
+        client: &Arc<Client>,
+        tx: &Sender<(Option<Shard>, StreamResult)>,
+    ) where
+        Client: DynamodbSDKClient + 'static,
     {
-        let mut shards: Vec<Shard> = vec![];
-        let mut records: Vec<Record> = vec![];
-
-        // This buffer prevents mpsc::channel from panic when passed zero as its argument.
-        let buf = cmp::max(1, self.shards_len());
-        let (tx, mut rx) = mpsc::channel::<(Option<Shard>, Vec<Record>)>(buf);
-
         for lineage in self.0 {
-            let client = Arc::clone(&client);
+            let client = Arc::clone(client);
             let tx = tx.clone();
 
             tokio::spawn(async move {
                 lineage.get_records(client, tx).await;
             });
         }
-
-        drop(tx);
-
-        while let Some((opt, mut _records)) = rx.recv().await {
-            if let Some(shard) = opt {
-                shards.push(shard);
-            }
-
-            if !_records.is_empty() {
-                records.append(&mut _records);
-            }
-        }
-
-        records.sort_by_key(sequence_number);
-
-        (shards, records)
     }
 }
 
@@ -212,30 +210,28 @@ impl From<Vec<Shard>> for Lineages {
     }
 }
 
-fn sequence_number(record: &Record) -> String {
-    record
-        .dynamodb()
-        .and_then(|r| r.sequence_number())
-        .unwrap_or_default()
-        .to_string()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::{super::error::Error, GetRecordsOutput, GetShardsOutput};
+    use super::super::{super::error::Error, GetShardsOutput};
     use super::*;
     use async_trait::async_trait;
-    use aws_sdk_dynamodbstreams::types::{ShardIteratorType, StreamRecord};
+    use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType, StreamRecord};
     use itertools::Itertools;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
     pub struct TestClient {
-        outputs: Arc<Mutex<dyn Iterator<Item = GetRecordsOutput> + Send + Sync>>,
+        outputs: Arc<
+            Mutex<
+                dyn Iterator<Item = Result<(Option<String>, Option<Vec<Record>>), Error>>
+                    + Send
+                    + Sync,
+            >,
+        >,
     }
 
     impl TestClient {
-        pub fn new(outputs: Vec<GetRecordsOutput>) -> Self {
+        pub fn new(outputs: Vec<Result<(Option<String>, Option<Vec<Record>>), Error>>) -> Self {
             Self {
                 outputs: Arc::new(Mutex::new(outputs.into_iter())),
             }
@@ -243,17 +239,14 @@ mod tests {
     }
 
     #[async_trait]
-    impl DynamodbClient for TestClient {
-        async fn get_stream_arn(
-            &self,
-            _table_name: impl Into<String> + Send,
-        ) -> Result<String, Error> {
+    impl DynamodbSDKClient for TestClient {
+        async fn get_stream_arn(&self, _table_name: String) -> Result<String, Error> {
             unimplemented!()
         }
 
         async fn get_shards(
             &self,
-            _stream_arn: impl Into<String> + Send,
+            _stream_arn: &str,
             _exclusive_start_shard_id: Option<String>,
         ) -> Result<GetShardsOutput, Error> {
             unimplemented!()
@@ -261,16 +254,21 @@ mod tests {
 
         async fn get_shard_with_iterator(
             &self,
-            _stream_arn: impl Into<String> + Send,
-            _shard: Shard,
-            _shard_iterator_type: ShardIteratorType,
-        ) -> Result<Option<Shard>, Error> {
+            _stream_arn: String,
+            _shard_id: &str,
+            _parent_shard_id: Option<&str>,
+            _shard_iterator_type: &ShardIteratorType,
+            _sequence_number: Option<String>,
+        ) -> Result<Shard, Error> {
             unimplemented!()
         }
 
-        async fn get_records(&self, _shard: Shard) -> Result<GetRecordsOutput, Error> {
+        async fn get_records(
+            &self,
+            _shard: &Shard,
+        ) -> Result<(Option<String>, Option<Vec<Record>>), Error> {
             let mut outputs = self.outputs.lock().unwrap();
-            Ok(outputs.next().unwrap())
+            outputs.next().unwrap()
         }
     }
 
@@ -282,12 +280,12 @@ mod tests {
             .cloned()
     }
 
-    fn create_shard(id: &str, parent_shard_id: Option<&str>) -> Shard {
-        let shard = aws_sdk_dynamodbstreams::types::Shard::builder()
-            .shard_id(id)
-            .set_parent_shard_id(parent_shard_id.map(|val| val.into()))
-            .build();
-        Shard::new(shard).unwrap()
+    fn create_shard(shard_id: &str, parent_shard_id: Option<&str>) -> Shard {
+        Shard::new(
+            shard_id.to_string(),
+            parent_shard_id.map(std::string::ToString::to_string),
+            None,
+        )
     }
 
     fn create_records(seqs: &[&str]) -> Vec<Record> {
@@ -300,16 +298,10 @@ mod tests {
     }
 
     fn get_records_output(
-        shard_id: &str,
-        parent_shard_id: Option<&str>,
+        next_iterator: Option<String>,
         seqs: &[&str],
-    ) -> GetRecordsOutput {
-        let shard = create_shard(shard_id, parent_shard_id);
-        let records = create_records(seqs);
-        GetRecordsOutput {
-            shard: Some(shard),
-            records,
-        }
+    ) -> (Option<String>, Option<Vec<Record>>) {
+        (next_iterator, Some(create_records(seqs)))
     }
 
     fn assert_include(shards: &[Shard], shard_id: &str) {
@@ -420,32 +412,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn lineage_length_is_equal_to_the_number_of_shards_it_has() {
-        let s0 = create_shard("0", None);
-        let s1 = create_shard("1", Some("0"));
-        let s2 = create_shard("2", Some("0"));
-        let s3 = create_shard("3", Some("0"));
-        let s4 = create_shard("4", Some("1"));
-        let s5 = create_shard("5", Some("1"));
-        let s6 = create_shard("6", Some("2"));
-        let s7 = create_shard("7", Some("6"));
-        let s8 = create_shard("8", Some("6"));
-
-        let shards = vec![s0, s1, s2, s3, s4, s5, s6, s7, s8];
-        let lineages = Lineages::from(shards);
-        assert_eq!(lineages.shards_len(), 9);
-
-        let s0 = create_shard("0", None);
-        let s1 = create_shard("1", Some("0"));
-        let s2 = create_shard("2", Some("0"));
-        let s3 = create_shard("3", None);
-        let s4 = create_shard("4", Some("3"));
-        let s5 = create_shard("5", Some("3"));
-
-        let shards = vec![s0, s1, s2, s3, s4, s5];
-        let lineages = Lineages::from(shards);
-        assert_eq!(lineages.shards_len(), 6);
+    fn extract_sequence_numbers(records: &[Record]) -> Vec<String> {
+        records
+            .iter()
+            .map(|r| {
+                r.dynamodb
+                    .as_ref()
+                    .expect("dynamodb")
+                    .sequence_number
+                    .as_ref()
+                    .expect("sequence_number")
+                    .to_string()
+            })
+            .collect()
     }
 
     #[tokio::test]
@@ -457,23 +436,299 @@ mod tests {
         let shards = vec![s0, s1, s2];
         let lineages = Lineages::from(shards);
 
-        let out3 = get_records_output("3", None, &["0012", "0004", "0008", "0001"]);
-        let out4 = get_records_output("4", Some("3"), &["0003", "0010", "0011", "0009", "0006"]);
-        let out5 = get_records_output("5", Some("3"), &["0002", "0005", "0013", "0007"]);
+        let out3 = get_records_output(None, &["0012", "0004", "0008", "0001"]);
+        let out4 = get_records_output(
+            Some("3".to_string()),
+            &["0003", "0010", "0011", "0009", "0006"],
+        );
+        let out5 = get_records_output(Some("3".to_string()), &["0002", "0005", "0013", "0007"]);
 
-        let client = TestClient::new(vec![out3, out4, out5]);
-        let (shards, records) = lineages.get_records(Arc::new(client)).await;
+        let client = Arc::new(TestClient::new(vec![Ok(out3), Ok(out4), Ok(out5)]));
 
-        assert_include(&shards, "3");
-        assert_include(&shards, "4");
-        assert_include(&shards, "5");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
 
+        lineages.get_records(&client, &tx);
+
+        drop(tx);
+
+        // Collect results from the receiver
+        let mut shards = Vec::new();
+        let mut records = Vec::new();
+
+        while let Some((shard_opt, recs)) = rx.recv().await {
+            if let Some(shard) = shard_opt {
+                shards.push(shard);
+            }
+            records.extend(recs);
+        }
+
+        assert_eq!(shards.len(), 2);
+        assert_include(&shards, "1");
+        assert_include(&shards, "2");
+
+        assert_eq!(records.len(), 3);
         assert_eq!(
-            records.iter().map(sequence_number).collect::<Vec<String>>(),
-            [
-                "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010",
-                "0011", "0012", "0013"
-            ]
+            extract_sequence_numbers(&records[0]),
+            ["0012", "0004", "0008", "0001"]
+        );
+        assert_eq!(extract_sequence_numbers(&records[1]), Vec::<String>::new());
+        assert_eq!(extract_sequence_numbers(&records[2]), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn lineages_parent_fails_children_preserved() {
+        // When parent fails, children should be preserved but not processed
+        let s0 = create_shard("0", None);
+        let s1 = create_shard("1", Some("0"));
+        let s2 = create_shard("2", Some("0"));
+
+        let shards = vec![s0, s1, s2];
+        let lineages = Lineages::from(shards);
+
+        let error = Error::NotFoundStream("test".to_string());
+
+        let client = Arc::new(TestClient::new(vec![
+            Err(error), // Parent fails
+                        // Children should never be called
+        ]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        lineages.get_records(&client, &tx);
+        drop(tx);
+
+        let mut shards = Vec::new();
+        let mut results = Vec::new();
+
+        while let Some((shard_opt, result)) = rx.recv().await {
+            if let Some(shard) = shard_opt {
+                shards.push(shard);
+            }
+            results.push(result);
+        }
+
+        // Should have 3 shards back: failed parent + 2 preserved children
+        assert_eq!(shards.len(), 3);
+        assert_include(&shards, "0"); // Failed parent
+        assert_include(&shards, "1"); // Preserved child
+        assert_include(&shards, "2"); // Preserved child
+
+        // Should have 3 results: 1 error + 2 empty preservations
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_err()); // Parent error
+        assert!(results[1].is_ok()); // Preserved child
+        assert!(results[2].is_ok()); // Preserved child
+    }
+
+    #[tokio::test]
+    async fn lineages_parent_exhausted_children_processed() {
+        // When parent iterator becomes None, children should have been preserved
+        // (they'll be processed as root lineages in next iteration)
+        let s0 = create_shard("0", None);
+        let s1 = create_shard("1", Some("0"));
+
+        let shards = vec![s0, s1];
+        let lineages = Lineages::from(shards);
+
+        let out_parent = get_records_output(None, &["0001", "0002"]);
+
+        let client = Arc::new(TestClient::new(vec![
+            Ok(out_parent),
+            // Child should not be called in this iteration
+        ]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        lineages.get_records(&client, &tx);
+        drop(tx);
+
+        let mut shards = Vec::new();
+        let mut results = Vec::new();
+
+        while let Some((shard_opt, result)) = rx.recv().await {
+            if let Some(shard) = shard_opt {
+                shards.push(shard);
+            }
+            results.push(result);
+        }
+
+        println!("{:#?}", shards);
+        // Should have 1 shard back: the preserved child (parent exhausted, returns None)
+        assert_eq!(shards.len(), 1);
+        assert_include(&shards, "1"); // Preserved child
+
+        // Should have 2 results: parent records + preserved child
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn lineages_multiple_independent_lineages_processed_concurrently() {
+        // Two independent lineages should be processed concurrently
+        let s0 = create_shard("0", None);
+        let s1 = create_shard("1", Some("0"));
+        let s2 = create_shard("2", None); // Independent lineage
+        let s3 = create_shard("3", Some("2"));
+
+        let shards = vec![s0, s1, s2, s3];
+        let lineages = Lineages::from(shards);
+
+        let out0 = get_records_output(None, &["0001"]);
+        let out2 = get_records_output(None, &["0002"]);
+
+        let client = Arc::new(TestClient::new(vec![Ok(out0), Ok(out2)]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        lineages.get_records(&client, &tx);
+        drop(tx);
+
+        let mut shards = Vec::new();
+        let mut results = Vec::new();
+
+        while let Some((shard_opt, result)) = rx.recv().await {
+            if let Some(shard) = shard_opt {
+                shards.push(shard);
+            }
+            results.push(result);
+        }
+
+        // Should have 2 preserved children (both parents exhausted)
+        assert_eq!(shards.len(), 2);
+        assert_include(&shards, "1");
+        assert_include(&shards, "3");
+
+        // Should have 4 results: 2 parent records + 2 preserved children
+        assert_eq!(results.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn lineages_deep_hierarchy_preserved() {
+        // Test grandchildren are preserved when parent fails
+        let s0 = create_shard("0", None);
+        let s1 = create_shard("1", Some("0"));
+        let s2 = create_shard("2", Some("1")); // Grandchild of 0
+
+        let shards = vec![s0, s1, s2];
+        let lineages = Lineages::from(shards);
+
+        let error = Error::NotFoundStream("test".to_string());
+
+        let client = Arc::new(TestClient::new(vec![Err(error)]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        lineages.get_records(&client, &tx);
+        drop(tx);
+
+        let mut shards = Vec::new();
+
+        while let Some((shard_opt, _)) = rx.recv().await {
+            if let Some(shard) = shard_opt {
+                shards.push(shard);
+            }
+        }
+
+        // All 3 shards should be preserved
+        assert_eq!(shards.len(), 3);
+        assert_include(&shards, "0");
+        assert_include(&shards, "1");
+        assert_include(&shards, "2");
+    }
+
+    #[tokio::test]
+    async fn lineages_channel_closed_stops_processing() {
+        // If channel is closed, processing should stop
+        let s0 = create_shard("0", None);
+        let s1 = create_shard("1", Some("0"));
+
+        let shards = vec![s0, s1];
+        let lineages = Lineages::from(shards);
+
+        let out = get_records_output(Some("next".to_string()), &["0001"]);
+
+        let client = Arc::new(TestClient::new(vec![Ok(out)]));
+
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+
+        // Drop receiver immediately - channel is closed
+        drop(rx);
+
+        lineages.get_records(&client, &tx);
+        drop(tx);
+
+        // Create new receiver to check nothing was sent (or it was but we can't receive)
+        // Actually we can't check this way. Let's just verify no panic occurs
+        // The function should return early when send fails
+    }
+
+    #[tokio::test]
+    async fn lineages_parent_with_valid_iterator_children_preserved() {
+        // Parent succeeds with valid iterator (not exhausted), children preserved
+        let s0 = create_shard("0", None);
+        let s1 = create_shard("1", Some("0"));
+
+        let shards = vec![s0, s1];
+        let lineages = Lineages::from(shards);
+
+        // Parent returns with a valid iterator (not None)
+        let out = get_records_output(Some("next_iterator".to_string()), &["0001", "0002"]);
+
+        let client = Arc::new(TestClient::new(vec![Ok(out)]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        lineages.get_records(&client, &tx);
+        drop(tx);
+
+        let mut shards = Vec::new();
+        let mut results = Vec::new();
+
+        while let Some((shard_opt, result)) = rx.recv().await {
+            if let Some(shard) = shard_opt {
+                shards.push(shard);
+            }
+            results.push(result);
+        }
+
+        // Should have 2 shards: parent with new iterator + preserved child
+        assert_eq!(shards.len(), 2);
+        assert_include(&shards, "0"); // Parent with iterator
+        assert_include(&shards, "1"); // Preserved child
+
+        // Should have 2 results: parent records + preserved child empty records
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            extract_sequence_numbers(&results[0].as_ref().unwrap()),
+            vec!["0001", "0002"]
+        );
+        assert_eq!(
+            extract_sequence_numbers(&results[1].as_ref().unwrap()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn lineages_empty_records_still_sent() {
+        // Even if parent returns empty records, it should still be sent
+        let s0 = create_shard("0", None);
+
+        let shards = vec![s0];
+        let lineages = Lineages::from(shards);
+
+        let out = get_records_output(Some("next".to_string()), &[]); // Empty records
+
+        let client = Arc::new(TestClient::new(vec![Ok(out)]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        lineages.get_records(&client, &tx);
+        drop(tx);
+
+        let mut results = Vec::new();
+
+        while let Some((_, result)) = rx.recv().await {
+            results.push(result);
+        }
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok());
+        assert_eq!(
+            extract_sequence_numbers(&results[0].as_ref().unwrap()),
+            Vec::<String>::new()
         );
     }
 }

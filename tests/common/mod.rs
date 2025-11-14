@@ -1,15 +1,15 @@
-use aws_config::{retry::RetryConfig, BehaviorVersion, Region, SdkConfig};
-use aws_credential_types::{provider::SharedCredentialsProvider, Credentials};
+use aws_config::{BehaviorVersion, Region, SdkConfig, retry::RetryConfig};
+use aws_credential_types::{Credentials, provider::SharedCredentialsProvider};
 use aws_sdk_dynamodb::{
+    Client,
     types::{
         AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType,
         ScalarAttributeType, StreamSpecification, StreamViewType,
     },
-    Client,
 };
 use aws_sdk_dynamodbstreams::types::Record;
 use dynamo_subscriber::stream::ConsumerChannel;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use ulid::Ulid;
 
 const TABLE: &str = "People";
@@ -44,6 +44,7 @@ pub async fn setup() -> TestConfig {
         .region(Some(Region::from_static("us-east-1")))
         .build();
 
+    drop_table(&config).await;
     create_table(&config).await;
 
     TestConfig {
@@ -119,10 +120,9 @@ async fn create_table(config: &SdkConfig) {
 }
 
 async fn drop_table(config: &SdkConfig) {
-    Client::new(config)
+    let _ = Client::new(config)
         .delete_table()
         .table_name(TABLE)
         .send()
-        .await
-        .unwrap();
+        .await;
 }

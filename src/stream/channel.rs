@@ -1,4 +1,4 @@
-use tokio::sync::oneshot::{self, error::TryRecvError, Receiver, Sender};
+use tokio::sync::oneshot::{self, Receiver, Sender, error::TryRecvError};
 use tracing::error;
 
 /// Create a pair of channel.
@@ -36,13 +36,13 @@ impl ProducerChannel {
 
     /// Send `Initialized` event to the channel half.
     pub fn send_init(&mut self) {
-        if let Some(tx) = self.sender.take() {
-            if let Err(err) = tx.send(()) {
-                error!(
-                    "Unexpected error during sending initialized event: {:?}",
-                    err
-                );
-            }
+        if let Some(tx) = self.sender.take()
+            && let Err(err) = tx.send(())
+        {
+            error!(
+                "Unexpected error during sending initialized event: {:?}",
+                err
+            );
         }
     }
 

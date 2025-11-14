@@ -10,7 +10,7 @@
 //!
 //! # async fn wrapper() {
 //! # let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-//! # let client = subscriber::Client::new(&config);
+//! # let client = subscriber::SDKClient::new(&config);
 //! // Create a stream from builder.
 //! let mut stream = subscriber::stream::builder()
 //!     .client(client)
@@ -37,7 +37,7 @@
 //!
 //! # async fn wrapper() {
 //! # let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-//! # let client = subscriber::Client::new(&config);
+//! # let client = subscriber::SDKClient::new(&config);
 //! // Create a stream from builder.
 //! let mut stream = subscriber::stream::builder()
 //!     .client(client)
@@ -63,12 +63,7 @@
 mod channel;
 mod dynamodb;
 
-use super::{client::DynamodbClient, error::Error, types};
+use super::{client_sdk::DynamodbSDKClient, error::Error, types};
 
 pub use channel::ConsumerChannel;
 pub use dynamodb::{DynamodbStream, DynamodbStreamBuilder};
-
-/// Create [`DynamodbStreamBuilder`].
-pub fn builder<C: DynamodbClient + 'static>() -> DynamodbStreamBuilder<C> {
-    DynamodbStreamBuilder::new()
-}

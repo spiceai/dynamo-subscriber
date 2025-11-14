@@ -32,7 +32,7 @@
 //!         .endpoint_url("http://localhost:8000")
 //!         .build();
 //!
-//!     let client = subscriber::Client::new(&config);
+//!     let client = subscriber::SDKClient::new(&config);
 //!     let mut stream = subscriber::stream::builder()
 //!         .table_name("People")
 //!         .client(client)
@@ -46,7 +46,7 @@
 //!
 //! ## AWS SDK Dependency
 //!
-//! To build [`Client`] of this crate, you must pass the reference for
+//! To build [`SDKClient`] of this crate, you must pass the reference for
 //! [`SdkConfig`](aws_config::SdkConfig).
 
 #[macro_use]
@@ -54,6 +54,8 @@ mod macros;
 
 /// Client for calling AWS APIs.
 pub mod client;
+
+mod client_sdk;
 
 /// Common errors.
 pub mod error;
@@ -64,4 +66,5 @@ pub mod types;
 /// Implementation for Dynamodb Streams.
 pub mod stream;
 
-pub use client::{Client, DynamodbClient};
+pub use client::{Client, ClientBuilder};
+pub use client_sdk::SDKClient;
