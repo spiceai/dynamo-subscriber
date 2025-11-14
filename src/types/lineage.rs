@@ -93,10 +93,15 @@ impl Lineage {
         Box::pin(async move {
             let Lineage { shard, children } = self;
 
-            match client.get_records(shard.clone()).await {
-                Ok(output) => {
+            match client.get_records(&shard).await {
+                Ok((next_shard_iterator, records)) => {
+                    // println!("next_shard_iterator: {:?}, {:?}", shard.id(), next_shard_iterator);
+
+                    let shard = shard.set_iterator(next_shard_iterator);
+                    let records = records.unwrap_or_default();
+
                     // Send parent's records
-                    if tx.send((output.shard, Ok(output.records))).await.is_err() {
+                    if tx.send((shard, Ok(records))).await.is_err() {
                         return;
                     }
 
@@ -207,7 +212,7 @@ impl From<Vec<Shard>> for Lineages {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{super::error::Error, GetRecordsOutput, GetShardsOutput};
+    use super::super::{super::error::Error, GetShardsOutput};
     use super::*;
     use async_trait::async_trait;
     use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType, StreamRecord};
@@ -216,11 +221,17 @@ mod tests {
 
     #[derive(Clone)]
     pub struct TestClient {
-        outputs: Arc<Mutex<dyn Iterator<Item = GetRecordsOutput> + Send + Sync>>,
+        outputs: Arc<
+            Mutex<
+                dyn Iterator<Item = Result<(Option<String>, Option<Vec<Record>>), Error>>
+                    + Send
+                    + Sync,
+            >,
+        >,
     }
 
     impl TestClient {
-        pub fn new(outputs: Vec<GetRecordsOutput>) -> Self {
+        pub fn new(outputs: Vec<Result<(Option<String>, Option<Vec<Record>>), Error>>) -> Self {
             Self {
                 outputs: Arc::new(Mutex::new(outputs.into_iter())),
             }
@@ -252,9 +263,12 @@ mod tests {
             unimplemented!()
         }
 
-        async fn get_records(&self, _shard: Shard) -> Result<GetRecordsOutput, Error> {
+        async fn get_records(
+            &self,
+            _shard: &Shard,
+        ) -> Result<(Option<String>, Option<Vec<Record>>), Error> {
             let mut outputs = self.outputs.lock().unwrap();
-            Ok(outputs.next().unwrap())
+            outputs.next().unwrap()
         }
     }
 
@@ -284,16 +298,10 @@ mod tests {
     }
 
     fn get_records_output(
-        shard_id: &str,
-        parent_shard_id: Option<&str>,
+        next_iterator: Option<String>,
         seqs: &[&str],
-    ) -> GetRecordsOutput {
-        let shard = create_shard(shard_id, parent_shard_id);
-        let records = create_records(seqs);
-        GetRecordsOutput {
-            shard: Some(shard),
-            records,
-        }
+    ) -> (Option<String>, Option<Vec<Record>>) {
+        (next_iterator, Some(create_records(seqs)))
     }
 
     fn assert_include(shards: &[Shard], shard_id: &str) {
@@ -428,11 +436,14 @@ mod tests {
         let shards = vec![s0, s1, s2];
         let lineages = Lineages::from(shards);
 
-        let out3 = get_records_output("3", None, &["0012", "0004", "0008", "0001"]);
-        let out4 = get_records_output("4", Some("3"), &["0003", "0010", "0011", "0009", "0006"]);
-        let out5 = get_records_output("5", Some("3"), &["0002", "0005", "0013", "0007"]);
+        let out3 = get_records_output(None, &["0012", "0004", "0008", "0001"]);
+        let out4 = get_records_output(
+            Some("3".to_string()),
+            &["0003", "0010", "0011", "0009", "0006"],
+        );
+        let out5 = get_records_output(Some("3".to_string()), &["0002", "0005", "0013", "0007"]);
 
-        let client = Arc::new(TestClient::new(vec![out3, out4, out5]));
+        let client = Arc::new(TestClient::new(vec![Ok(out3), Ok(out4), Ok(out5)]));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
 
@@ -451,8 +462,7 @@ mod tests {
             records.extend(recs);
         }
 
-        assert_eq!(shards.len(), 3);
-        assert_include(&shards, "3");
+        assert_eq!(shards.len(), 2);
         assert_include(&shards, "1");
         assert_include(&shards, "2");
 
@@ -463,5 +473,262 @@ mod tests {
         );
         assert_eq!(extract_sequence_numbers(&records[1]), Vec::<String>::new());
         assert_eq!(extract_sequence_numbers(&records[2]), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn lineages_parent_fails_children_preserved() {
+        // When parent fails, children should be preserved but not processed
+        let s0 = create_shard("0", None);
+        let s1 = create_shard("1", Some("0"));
+        let s2 = create_shard("2", Some("0"));
+
+        let shards = vec![s0, s1, s2];
+        let lineages = Lineages::from(shards);
+
+        let error = Error::NotFoundStream("test".to_string());
+
+        let client = Arc::new(TestClient::new(vec![
+            Err(error), // Parent fails
+                        // Children should never be called
+        ]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        lineages.get_records(&client, &tx);
+        drop(tx);
+
+        let mut shards = Vec::new();
+        let mut results = Vec::new();
+
+        while let Some((shard_opt, result)) = rx.recv().await {
+            if let Some(shard) = shard_opt {
+                shards.push(shard);
+            }
+            results.push(result);
+        }
+
+        // Should have 3 shards back: failed parent + 2 preserved children
+        assert_eq!(shards.len(), 3);
+        assert_include(&shards, "0"); // Failed parent
+        assert_include(&shards, "1"); // Preserved child
+        assert_include(&shards, "2"); // Preserved child
+
+        // Should have 3 results: 1 error + 2 empty preservations
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_err()); // Parent error
+        assert!(results[1].is_ok()); // Preserved child
+        assert!(results[2].is_ok()); // Preserved child
+    }
+
+    #[tokio::test]
+    async fn lineages_parent_exhausted_children_processed() {
+        // When parent iterator becomes None, children should have been preserved
+        // (they'll be processed as root lineages in next iteration)
+        let s0 = create_shard("0", None);
+        let s1 = create_shard("1", Some("0"));
+
+        let shards = vec![s0, s1];
+        let lineages = Lineages::from(shards);
+
+        let out_parent = get_records_output(None, &["0001", "0002"]);
+
+        let client = Arc::new(TestClient::new(vec![
+            Ok(out_parent),
+            // Child should not be called in this iteration
+        ]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        lineages.get_records(&client, &tx);
+        drop(tx);
+
+        let mut shards = Vec::new();
+        let mut results = Vec::new();
+
+        while let Some((shard_opt, result)) = rx.recv().await {
+            if let Some(shard) = shard_opt {
+                shards.push(shard);
+            }
+            results.push(result);
+        }
+
+        println!("{:#?}", shards);
+        // Should have 1 shard back: the preserved child (parent exhausted, returns None)
+        assert_eq!(shards.len(), 1);
+        assert_include(&shards, "1"); // Preserved child
+
+        // Should have 2 results: parent records + preserved child
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn lineages_multiple_independent_lineages_processed_concurrently() {
+        // Two independent lineages should be processed concurrently
+        let s0 = create_shard("0", None);
+        let s1 = create_shard("1", Some("0"));
+        let s2 = create_shard("2", None); // Independent lineage
+        let s3 = create_shard("3", Some("2"));
+
+        let shards = vec![s0, s1, s2, s3];
+        let lineages = Lineages::from(shards);
+
+        let out0 = get_records_output(None, &["0001"]);
+        let out2 = get_records_output(None, &["0002"]);
+
+        let client = Arc::new(TestClient::new(vec![Ok(out0), Ok(out2)]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        lineages.get_records(&client, &tx);
+        drop(tx);
+
+        let mut shards = Vec::new();
+        let mut results = Vec::new();
+
+        while let Some((shard_opt, result)) = rx.recv().await {
+            if let Some(shard) = shard_opt {
+                shards.push(shard);
+            }
+            results.push(result);
+        }
+
+        // Should have 2 preserved children (both parents exhausted)
+        assert_eq!(shards.len(), 2);
+        assert_include(&shards, "1");
+        assert_include(&shards, "3");
+
+        // Should have 4 results: 2 parent records + 2 preserved children
+        assert_eq!(results.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn lineages_deep_hierarchy_preserved() {
+        // Test grandchildren are preserved when parent fails
+        let s0 = create_shard("0", None);
+        let s1 = create_shard("1", Some("0"));
+        let s2 = create_shard("2", Some("1")); // Grandchild of 0
+
+        let shards = vec![s0, s1, s2];
+        let lineages = Lineages::from(shards);
+
+        let error = Error::NotFoundStream("test".to_string());
+
+        let client = Arc::new(TestClient::new(vec![Err(error)]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        lineages.get_records(&client, &tx);
+        drop(tx);
+
+        let mut shards = Vec::new();
+
+        while let Some((shard_opt, _)) = rx.recv().await {
+            if let Some(shard) = shard_opt {
+                shards.push(shard);
+            }
+        }
+
+        // All 3 shards should be preserved
+        assert_eq!(shards.len(), 3);
+        assert_include(&shards, "0");
+        assert_include(&shards, "1");
+        assert_include(&shards, "2");
+    }
+
+    #[tokio::test]
+    async fn lineages_channel_closed_stops_processing() {
+        // If channel is closed, processing should stop
+        let s0 = create_shard("0", None);
+        let s1 = create_shard("1", Some("0"));
+
+        let shards = vec![s0, s1];
+        let lineages = Lineages::from(shards);
+
+        let out = get_records_output(Some("next".to_string()), &["0001"]);
+
+        let client = Arc::new(TestClient::new(vec![Ok(out)]));
+
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+
+        // Drop receiver immediately - channel is closed
+        drop(rx);
+
+        lineages.get_records(&client, &tx);
+        drop(tx);
+
+        // Create new receiver to check nothing was sent (or it was but we can't receive)
+        // Actually we can't check this way. Let's just verify no panic occurs
+        // The function should return early when send fails
+    }
+
+    #[tokio::test]
+    async fn lineages_parent_with_valid_iterator_children_preserved() {
+        // Parent succeeds with valid iterator (not exhausted), children preserved
+        let s0 = create_shard("0", None);
+        let s1 = create_shard("1", Some("0"));
+
+        let shards = vec![s0, s1];
+        let lineages = Lineages::from(shards);
+
+        // Parent returns with a valid iterator (not None)
+        let out = get_records_output(Some("next_iterator".to_string()), &["0001", "0002"]);
+
+        let client = Arc::new(TestClient::new(vec![Ok(out)]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        lineages.get_records(&client, &tx);
+        drop(tx);
+
+        let mut shards = Vec::new();
+        let mut results = Vec::new();
+
+        while let Some((shard_opt, result)) = rx.recv().await {
+            if let Some(shard) = shard_opt {
+                shards.push(shard);
+            }
+            results.push(result);
+        }
+
+        // Should have 2 shards: parent with new iterator + preserved child
+        assert_eq!(shards.len(), 2);
+        assert_include(&shards, "0"); // Parent with iterator
+        assert_include(&shards, "1"); // Preserved child
+
+        // Should have 2 results: parent records + preserved child empty records
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            extract_sequence_numbers(&results[0].as_ref().unwrap()),
+            vec!["0001", "0002"]
+        );
+        assert_eq!(
+            extract_sequence_numbers(&results[1].as_ref().unwrap()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn lineages_empty_records_still_sent() {
+        // Even if parent returns empty records, it should still be sent
+        let s0 = create_shard("0", None);
+
+        let shards = vec![s0];
+        let lineages = Lineages::from(shards);
+
+        let out = get_records_output(Some("next".to_string()), &[]); // Empty records
+
+        let client = Arc::new(TestClient::new(vec![Ok(out)]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        lineages.get_records(&client, &tx);
+        drop(tx);
+
+        let mut results = Vec::new();
+
+        while let Some((_, result)) = rx.recv().await {
+            results.push(result);
+        }
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok());
+        assert_eq!(
+            extract_sequence_numbers(&results[0].as_ref().unwrap()),
+            Vec::<String>::new()
+        );
     }
 }

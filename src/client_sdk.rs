@@ -1,11 +1,12 @@
 use super::{
     error::Error,
-    types::{GetRecordsOutput, GetShardsOutput, Shard},
+    types::{GetShardsOutput, Shard},
 };
 
 use async_trait::async_trait;
 use aws_config::SdkConfig;
 use aws_sdk_dynamodb::Client as DbClient;
+use aws_sdk_dynamodbstreams::types::Record;
 use aws_sdk_dynamodbstreams::{
     Client as StreamsClient,
     error::SdkError,
@@ -107,7 +108,10 @@ pub trait DynamodbSDKClient: Clone + Send + Sync {
 
     /// Return a vector of [`Record`](aws_sdk_dynamodbstreams::types::Record) and a
     /// [`Shard`](crate::types::Shard) with shard iterator id for next getting records call.
-    async fn get_records(&self, shard: Shard) -> Result<GetRecordsOutput, Error>;
+    async fn get_records(
+        &self,
+        shard: &Shard,
+    ) -> Result<(Option<String>, Option<Vec<Record>>), Error>;
 }
 
 #[async_trait]
@@ -185,7 +189,10 @@ impl DynamodbSDKClient for SDKClient {
         ))
     }
 
-    async fn get_records(&self, shard: Shard) -> Result<GetRecordsOutput, Error> {
+    async fn get_records(
+        &self,
+        shard: &Shard,
+    ) -> Result<(Option<String>, Option<Vec<Record>>), Error> {
         let iterator = shard.iterator().map(std::string::ToString::to_string);
 
         self.streams
@@ -194,12 +201,7 @@ impl DynamodbSDKClient for SDKClient {
             .send()
             .await
             .or_else(empty_records)
-            .map(|output| {
-                let shard = shard.set_iterator(output.next_shard_iterator);
-                let records = output.records.unwrap_or_default();
-
-                GetRecordsOutput { shard, records }
-            })
+            .map(|output| (output.next_shard_iterator, output.records))
     }
 }
 
