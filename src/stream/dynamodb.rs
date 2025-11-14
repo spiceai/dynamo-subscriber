@@ -93,6 +93,10 @@ where
         // lineages based on shards we want to look into
         let lineages: Lineages = shards_to_look_into.clone().into();
 
+        let mut shard_ids = lineages.0.iter().map(|l| l.shard.id.split('-').last().unwrap_or("")).collect::<Vec<_>>();
+        shard_ids.sort();
+        tracing::info!("New iteration with lineages: {:?}", shard_ids);
+
         lineages.get_records(&self.client(), &tx);
         drop(tx);
 
@@ -119,6 +123,10 @@ where
         let mut new_shards = self
             .get_shard_iterators(new_shards, ShardIteratorType::TrimHorizon)
             .await;
+
+        if !new_shards.is_empty() {
+            tracing::info!("new_shards: {:?}", new_shards.clone().iter().map(|shard| shard.id.clone()).collect::<Vec<String>>());
+        }
 
         shards.append(&mut new_shards);
         self.shards = Some(shards);

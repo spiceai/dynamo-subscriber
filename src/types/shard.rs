@@ -3,7 +3,7 @@ use aws_sdk_dynamodbstreams as dynamodbstreams;
 /// A shard representation to retreive DynamoDB Streams records.
 #[derive(Debug, Clone)]
 pub struct Shard {
-    id: String,
+    pub id: String,
     iterator: Option<String>,
     parent_shard_id: Option<String>,
     pub ending_sequence_number: Option<String>,

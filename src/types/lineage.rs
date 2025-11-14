@@ -14,7 +14,7 @@ use tracing::error;
 #[derive(Debug, Clone)]
 pub struct Lineage {
     /// The parent shard of this children.
-    shard: Shard,
+    pub shard: Shard,
 
     /// The lineages from the child of this shard.
     children: Vec<Lineage>,
@@ -93,29 +93,54 @@ impl Lineage {
         Box::pin(async move {
             let Lineage { shard, children } = self;
 
+            let shard_clone = shard.clone();
+            let shard_id = shard_clone.id();
+
             match client.get_records(&shard).await {
                 Ok((next_shard_iterator, records)) => {
-                    // println!("next_shard_iterator: {:?}, {:?}", shard.id(), next_shard_iterator);
 
-                    let shard = shard.set_iterator(next_shard_iterator);
+                    let shard = shard.set_iterator(next_shard_iterator.clone());
                     let records = records.unwrap_or_default();
+
+                    let id_versions: Vec<(String, i64)> = records.clone()
+                        .into_iter()
+                        .filter_map(|record| {
+                            let dynamodb = record.dynamodb?;
+                            let id = dynamodb.keys?.get("id")?.as_n().ok()?.clone();
+                            let version = dynamodb.new_image?.get("version")?.as_s().ok()?.parse::<i64>().ok()?;
+                            Some((id, version))
+                        })
+                        .collect();
+
+                    if !id_versions.is_empty() {
+                        tracing::info!("shard {} returned records: {:?}", shard_id.split('-').last().unwrap_or(""), id_versions);
+                    }
+
+                    if next_shard_iterator.is_none() {
+                        tracing::info!("shard {} expired", shard_id);
+                    }
 
                     // Send parent's records
                     if tx.send((shard, Ok(records))).await.is_err() {
                         return;
                     }
 
-                    preserve_subtree(children, &tx).await;
+                    if !children.is_empty() {
+                        preserve_subtree(children, &tx).await;
+                    }
+
                 }
                 Err(err) => {
                     // Parent failed - send error but DON'T process children
-                    error!("Parent shard failed: {err}");
+                    tracing::error!("Shard {} failed: {err}", shard_id);
                     if tx.send((Some(shard), Err(err))).await.is_err() {
                         // Channel closed - just return
                         return;
                     }
 
-                    preserve_subtree(children, &tx).await;
+                    if !children.is_empty() {
+                        preserve_subtree(children, &tx).await;
+                    }
                 }
             }
         })
@@ -146,7 +171,7 @@ fn preserve_subtree(
 
 /// A representation of group of shard lineage(parent and children).
 #[derive(Debug, Clone)]
-pub struct Lineages(Vec<Lineage>);
+pub struct Lineages(pub Vec<Lineage>);
 
 impl Lineages {
     /// Create a new lineage group
@@ -550,7 +575,6 @@ mod tests {
             results.push(result);
         }
 
-        println!("{:#?}", shards);
         // Should have 1 shard back: the preserved child (parent exhausted, returns None)
         assert_eq!(shards.len(), 1);
         assert_include(&shards, "1"); // Preserved child
